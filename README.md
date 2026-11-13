@@ -71,6 +71,48 @@ may be missed. There are no file-changing actions in these views.
 
 ## Saved data and limits
 
+### Personal review and local recognition
+
+Use the **SIFT** desktop shortcut, or **Review Library** from the main window.
+When a scan finishes, Review opens with **Browse**, **Duplicates**, and
+**Screenshots & Clutter**. In Browse, **Prepare JPEG/PNG previews** creates the
+inputs for recognition. **Categorize locally** uses ready previews for the
+chosen folder (or all saved folders). Results refresh automatically when it
+finishes; select an image and copy its suggested name from the
+details. Suggestions never rename originals. Uncertain labels are marked,
+and possible clutter is a review cue, never a deletion decision.
+
+The optional recognition engine uses [Google SigLIP2 Base 224](https://huggingface.co/google/siglip2-base-patch16-224),
+an Apache-2.0 checkpoint. Its weights are about 1.5 GB, in addition to the Python
+runtime packages. Inference runs on the CPU and may take time on a large library.
+It recognizes a small set of subjects from previews; it does not read document
+text or identify people. The model's label scores are not calibrated probabilities.
+
+One-time setup, from the SIFT root with the app closed:
+
+1. Install the Windows CPU build of PyTorch into this repository's `.venv`
+   using the [official PyTorch instructions](https://pytorch.org/get-started/locally/).
+2. Install the optional processor and inference libraries:
+   `.\.venv\Scripts\python.exe -m pip install "transformers==4.57.6" sentencepiece`.
+3. Run the Hugging Face CLI from the same environment to download only model
+   assets (no library files are involved):
+
+   ```powershell
+   .\.venv\Scripts\hf.exe download google/siglip2-base-patch16-224 --revision 75de2d5 --local-dir "$env:LOCALAPPDATA\Sift\siglip2-base-patch16-224" --include "*.json" tokenizer.model model.safetensors
+   ```
+
+4. Open SIFT again and use **Categorize locally**. The app never downloads
+   weights on launch, uses only local model assets, and checks the published
+   weights checksum. Browse and Duplicates work without these optional packages.
+
+Categories and name suggestions are saved in the local library database, with
+the source fingerprint, preview version and recognizer version. The first
+category run backs up the database before creating its optional table. Network
+shares are not scanned, and ffprobe is restricted to local files and approved
+media formats. These application restrictions do not control Windows sync tools.
+
+### Library storage and scan behavior
+
 - The database is `%LOCALAPPDATA%\Sift\sift.db`. Inventory, metadata, hashes,
   image features and previews are stored there, outside scanned folders. First
   image-feature installation makes a sibling `image-features-*.bak` database backup.
