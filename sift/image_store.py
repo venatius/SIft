@@ -5,6 +5,7 @@ from uuid import uuid4
 
 from . import database
 from .image_analysis import VERSION
+from .local_recognition import RECOGNITION_VERSION
 
 PAGE_SIZE = 60
 SCHEMA = """
@@ -38,18 +39,22 @@ def install(db_path):
     conn = database.connect(db_path)
     try:
         if not installed(conn):
-            backup_path = Path(db_path).with_name(f"image-features-{uuid4().hex}.bak")
-            backup = database.connect(backup_path)
-            try:
-                conn.backup(backup)
-            finally:
-                backup.close()
-            conn.execute(SCHEMA)
-            conn.commit()
+            add_table(conn, db_path, SCHEMA)
         return conn
     except BaseException:
         conn.close()
         raise
+
+
+def add_table(conn, db_path, schema):
+    backup_path = Path(db_path).with_name(f"image-features-{uuid4().hex}.bak")
+    backup = database.connect(backup_path)
+    try:
+        conn.backup(backup)
+    finally:
+        backup.close()
+    conn.execute(schema)
+    conn.commit()
 
 
 # A cached image is valid only against the saved, successful current fingerprint.
@@ -132,7 +137,7 @@ def roots(conn):
     return [dict(row) for row in conn.execute("SELECT id, path FROM roots ORDER BY path, id")]
 
 
-def browse(conn, root_id=None, text="", status="all", after=0):
+def browse(conn, root_id=None, text="", status="all", after=0, category="all"):
     """A bounded stable ID page; queries never inspect source files."""
     if status not in {"all", "ready", "failed", "pending", "unsupported"}:
         raise ValueError("Unknown image status filter")
@@ -144,6 +149,14 @@ def browse(conn, root_id=None, text="", status="all", after=0):
             "NULL AS input_modified_ns, NULL AS input_sha256, NULL AS status, "
             "NULL AS thumbnail, NULL AS error) v ON v.file_id = f.id"
         )
+    )
+    has_categories = categories_installed(conn)
+    category_join = (
+        "LEFT JOIN image_categories c ON c.file_id = f.id "
+        "AND c.input_sha256 = p.sha256 AND c.preview_version = v.version "
+        "AND c.recognition_version = ?"
+        if has_categories
+        else "LEFT JOIN (SELECT NULL AS category, NULL AS suggested, NULL AS uncertain) c ON 0"
     )
     query = (
         """WITH library AS (
@@ -161,24 +174,89 @@ def browse(conn, root_id=None, text="", status="all", after=0):
         + FEATURE_CURRENT
         + """
             AND v.status = 'ok' THEN v.thumbnail ELSE NULL END AS thumbnail,
-          v.error
+          v.error, c.category, c.suggested, c.uncertain
         FROM files f JOIN roots r ON r.id = f.root_id
         LEFT JOIN fingerprints p ON p.file_id = f.id
         """
         + feature_join
+        + " "
+        + category_join
         + """
         WHERE f.id > ? AND (? IS NULL OR f.root_id = ?)
           AND instr(lower(f.path), lower(?)) > 0
         ) SELECT * FROM library WHERE (? = 'all' OR image_status = ?)
+        AND (? = 'all' OR (image_status = 'ready' AND
+           (category = ? OR (? = 'review' AND category IN ('Screenshots', 'Possible clutter')))))
         ORDER BY id LIMIT ?"""
     )
     rows = [
         dict(row)
         for row in conn.execute(
-            query, (VERSION, VERSION, after, root_id, root_id, text, status, status, PAGE_SIZE + 1)
+            query,
+            (
+                VERSION,
+                VERSION,
+                *((RECOGNITION_VERSION,) if has_categories else ()),
+                after,
+                root_id,
+                root_id,
+                text,
+                status,
+                status,
+                category,
+                category,
+                category,
+                PAGE_SIZE + 1,
+            ),
         )
     ]
     return rows[:PAGE_SIZE], len(rows) > PAGE_SIZE
+
+
+def categories_installed(conn):
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='image_categories'"
+        ).fetchone()
+        is not None
+    )
+
+
+CATEGORY_SCHEMA = """CREATE TABLE IF NOT EXISTS image_categories (
+    file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+    input_sha256 TEXT NOT NULL,
+    preview_version TEXT NOT NULL,
+    recognition_version TEXT NOT NULL,
+    category TEXT NOT NULL,
+    suggested TEXT NOT NULL,
+    uncertain INTEGER NOT NULL
+)"""
+
+
+def recognition_rows(conn, root_id):
+    return conn.execute(
+        """SELECT f.id, f.path, p.sha256, v.thumbnail FROM files f
+        JOIN fingerprints p ON p.file_id = f.id
+        JOIN image_features v ON v.file_id = f.id WHERE """
+        + CURRENT
+        + " AND "
+        + FEATURE_CURRENT
+        + """ AND v.status = 'ok' AND (? IS NULL OR f.root_id = ?)
+        ORDER BY f.id""",
+        (VERSION, root_id, root_id),
+    )
+
+
+def save_category(conn, row, result):
+    conn.execute(
+        """INSERT INTO image_categories VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(file_id) DO UPDATE SET input_sha256=excluded.input_sha256,
+        preview_version=excluded.preview_version,
+        recognition_version=excluded.recognition_version, category=excluded.category,
+        suggested=excluded.suggested, uncertain=excluded.uncertain""",
+        (row["id"], row["sha256"], VERSION, RECOGNITION_VERSION, *result),
+    )
+    conn.commit()
 
 
 def visual_rows(conn, root_id=None, file_id=None):
