@@ -12,6 +12,8 @@ import PIL
 import pillow_heif
 from PIL import Image, UnidentifiedImageError
 
+from .local_paths import is_network_path
+
 try:
     import rawpy
 except ImportError:
@@ -290,6 +292,10 @@ def _run_ffprobe(exe, path, cancel_check):
         "json",
         "-show_format",
         "-show_streams",
+        "-protocol_whitelist",
+        "file",
+        "-format_whitelist",
+        "mov,matroska,avi,mpegts,m4v,mp3,aac,wav,flac,ogg,asf,aiff",
         "-i",
         path,
     ]  # a list: no shell, no quoting issues
@@ -323,6 +329,8 @@ def _float(value):
 
 
 def extract_video_metadata(path, cancel_check):
+    if is_network_path(path):
+        return MetadataResult("unsupported", error="Network media paths are not probed")
     exe = ffprobe_path()
     if not exe:
         return MetadataResult("failed", error="ffprobe not found; install FFmpeg")
