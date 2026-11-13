@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 from . import database
 from .duplicates import DuplicateWorker
 from .image_browser import ImageBrowser
+from .local_paths import is_network_path
 from .worker import ScanWorker
 
 LOCAL_APP_DATA = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
@@ -45,7 +46,7 @@ class MainWindow(QMainWindow):
         self.pause_btn = QPushButton("Pause")
         self.cancel_btn = QPushButton("Cancel")
         self.duplicates_btn = QPushButton("Find Exact Duplicates (All Folders)")
-        self.browse_btn = QPushButton("Browse Library")
+        self.browse_btn = QPushButton("Review Library")
         self.status_label = QLabel("Ready")
         self.count_label = QLabel("Files found: 0")
         self.saved_label = QLabel("")
@@ -59,7 +60,6 @@ class MainWindow(QMainWindow):
             self.start_btn,
             self.pause_btn,
             self.cancel_btn,
-            self.duplicates_btn,
             self.browse_btn,
         ):
             buttons.addWidget(b)
@@ -100,7 +100,11 @@ class MainWindow(QMainWindow):
         interrupted = database.mark_interrupted(conn)
         latest_root = database.get_latest_root(conn)
         conn.close()
-        if latest_root and os.path.isdir(latest_root["path"]):
+        if (
+            latest_root
+            and not is_network_path(latest_root["path"])
+            and os.path.isdir(latest_root["path"])
+        ):
             self.folder = latest_root["path"]
             self.folder_label.setText(self.folder)
             self.start_btn.setEnabled(True)
@@ -277,6 +281,8 @@ class MainWindow(QMainWindow):
                 lines.append(f"  {path}\n      {message}")
         self.report.setPlainText("\n".join(lines))
         self.refresh_saved_count()
+        if s.get("status") == "completed" and self.isVisible():
+            self.browse_library()
 
     def closeEvent(self, event):
         if self.image_browser is not None and self.image_browser.worker is not None:
