@@ -13,9 +13,12 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
+    QStackedWidget,
+    QTabBar,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
+    QWidget,
 )
 
 from .image_worker import ImageWorker
@@ -28,13 +31,14 @@ class ImageBrowser(QDialog):
         self.worker = None
         self._closing = False
         self._operation = None
+        self._recognition_summary = None
         self._after = 0
         self._history = []
         self._rows = []
         self._has_more = False
         self._filters = None
         self._pending_page = None
-        self.setWindowTitle("Sift — Saved library")
+        self.setWindowTitle("Sift — Review")
         self.resize(1000, 700)
         self.setModal(True)
 
@@ -52,6 +56,12 @@ class ImageBrowser(QDialog):
         self.search = QLineEdit()
         self.search.setPlaceholderText("Filter saved paths (literal text)")
         self.apply_btn = QPushButton("Apply filters")
+        self.category_filter = QComboBox()
+        self.category_filter.setAccessibleName("Image category")
+        self.category_filter.addItem("All categories", "all")
+        for category in ("Screenshots", "Documents", "Everyday photos", "Possible clutter"):
+            self.category_filter.addItem(category, category)
+        self.recognize_btn = QPushButton("Categorize locally")
         self.prepare_btn = QPushButton("Prepare JPEG/PNG previews")
         self.similar_btn = QPushButton("Find possible visual matches for selected image")
         self.force_check = QCheckBox("Rebuild saved previews")
@@ -66,7 +76,9 @@ class ImageBrowser(QDialog):
         )
         self.notice.setWordWrap(True)
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["File", "Preview status", "Saved path", "Library root"])
+        self.tree.setHeaderLabels(
+            ["File", "Preview status", "Saved path", "Library root", "Category"]
+        )
         self.tree.setIconSize(QSize(96, 96))
         self.tree.setColumnWidth(0, 220)
         self.tree.setColumnWidth(1, 170)
@@ -80,24 +92,46 @@ class ImageBrowser(QDialog):
         self.matches.setColumnWidth(0, 170)
         self.matches.setColumnWidth(1, 540)
         filters = QHBoxLayout()
-        for control in (self.root_filter, self.status_filter, self.search, self.apply_btn):
+        for control in (
+            self.root_filter,
+            self.status_filter,
+            self.category_filter,
+            self.search,
+            self.apply_btn,
+        ):
             filters.addWidget(control)
         actions = QHBoxLayout()
-        for control in (self.prepare_btn, self.force_check, self.cancel_btn):
+        for control in (self.prepare_btn, self.recognize_btn, self.force_check):
             actions.addWidget(control)
         pages = QHBoxLayout()
-        for control in (self.previous_btn, self.next_btn, self.close_btn):
+        for control in (self.previous_btn, self.next_btn, self.cancel_btn, self.close_btn):
             pages.addWidget(control)
+        self.tabs = QTabBar()
+        for name in ("Browse", "Duplicates", "Screenshots && Clutter"):
+            self.tabs.addTab(name)
+        self.stack = QStackedWidget()
+        browse_panel = QWidget()
+        browse_layout = QVBoxLayout(browse_panel)
+        browse_layout.addLayout(filters)
+        browse_layout.addLayout(actions)
+        browse_layout.addWidget(self.tree)
+        browse_layout.addWidget(self.similar_btn)
+        browse_layout.addWidget(self.matches)
+        browse_layout.addWidget(self.details)
+        self.duplicate_report = QPlainTextEdit()
+        self.duplicate_report.setReadOnly(True)
+        self.duplicate_report.setAccessibleName("Exact duplicate results")
+        self.stack.addWidget(browse_panel)
+        self.stack.addWidget(self.duplicate_report)
         layout = QVBoxLayout(self)
         layout.addWidget(self.notice)
-        layout.addLayout(filters)
-        layout.addLayout(actions)
+        layout.addWidget(self.tabs)
         layout.addWidget(self.status_label)
-        layout.addWidget(self.tree)
-        layout.addWidget(self.similar_btn)
-        layout.addWidget(self.matches)
-        layout.addWidget(self.details)
+        layout.addWidget(self.stack)
         layout.addLayout(pages)
+        self.tabs.currentChanged.connect(self.switch_tab)
+        self.recognize_btn.clicked.connect(self.recognize_images)
+        self.category_filter.currentIndexChanged.connect(self.on_filter_edited)
         self.apply_btn.clicked.connect(self.load_first_page)
         self.search.returnPressed.connect(self.load_first_page)
         self.prepare_btn.clicked.connect(self.prepare_images)
@@ -116,7 +150,23 @@ class ImageBrowser(QDialog):
             "root_id": self.root_filter.currentData(),
             "text": self.search.text(),
             "status": self.status_filter.currentData(),
+            "category": (
+                "review" if self.tabs.currentIndex() == 2 else self.category_filter.currentData()
+            ),
         }
+
+    def switch_tab(self, index):
+        self.stack.setCurrentIndex(int(index == 1))
+        self.category_filter.setVisible(index != 2)
+        if index == 1:
+            self.duplicate_report.setPlainText("Checking saved fingerprints…")
+            self.start_job("duplicates")
+        else:
+            self.load_first_page()
+
+    def recognize_images(self):
+        self.status_label.setText("Categorizing saved previews on this PC…")
+        self.start_job("recognize", root_id=self.root_filter.currentData())
 
     def on_filter_edited(self):
         if self.worker is None:
@@ -130,10 +180,13 @@ class ImageBrowser(QDialog):
             self.apply_btn,
             self.prepare_btn,
             self.force_check,
+            self.tabs,
+            self.recognize_btn,
+            self.category_filter,
         ):
             control.setEnabled(not busy)
         self.cancel_btn.setEnabled(busy)
-        applied = self._filters == self.filter_values()
+        applied = self.tabs.currentIndex() != 1 and self._filters == self.filter_values()
         self.previous_btn.setEnabled(not busy and applied and bool(self._history))
         self.next_btn.setEnabled(not busy and applied and self._has_more)
         self.tree.setEnabled(not busy)
@@ -202,6 +255,11 @@ class ImageBrowser(QDialog):
             self.worker.cancel()
 
     def on_progress(self, summary):
+        if "classified" in summary:
+            self.status_label.setText(
+                f"Local recognition: {summary['classified']} categorized, {summary['failed']} failed"
+            )
+            return
         self.status_label.setText(
             f"Images: {summary['prepared']} prepared, {summary['reused']} reused, "
             f"{summary['failed']} failed, {summary['unsupported']} unsupported"
@@ -209,6 +267,20 @@ class ImageBrowser(QDialog):
 
     def on_result(self, result):
         if self._closing:
+            return
+        if self._operation == "duplicates":
+            groups, empty = result
+            lines = [
+                f"{len(groups)} exact duplicate groups across all saved folders.",
+                f"{empty} empty files (not listed as duplicates). Rescan to refresh saved results.",
+            ]
+            for number, (_, paths) in enumerate(groups, 1):
+                lines.extend((f"\nGroup {number} · {len(paths)} files", *paths))
+            self.duplicate_report.setPlainText("\n".join(lines))
+            self.status_label.setText("Exact duplicate results ready")
+            return
+        if self._operation == "recognize":
+            self._recognition_summary = result
             return
         if self._operation == "prepare":
             self.on_progress(result)
@@ -231,8 +303,10 @@ class ImageBrowser(QDialog):
         self.root_filter.setCurrentIndex(max(0, self.root_filter.findData(selected_root)))
         self.tree.clear()
         for row in self._rows:
+            category = row.get("category") if row["image_status"] == "ready" else None
+            label = category + (" · uncertain" if row["uncertain"] else "") if category else ""
             item = QTreeWidgetItem(
-                [Path(row["path"]).name, row["image_status"], row["path"], row["root"]]
+                [Path(row["path"]).name, row["image_status"], row["path"], row["root"], label]
             )
             item.setData(0, Qt.ItemDataRole.UserRole, row)
             item.setToolTip(0, row["path"])
@@ -245,6 +319,10 @@ class ImageBrowser(QDialog):
             f"{len(self._rows)} saved records on page {len(self._history) + 1}"
         )
         self.details.setPlainText("Select a record to see its saved path and any preview error.")
+        if not self._rows and self.tabs.currentIndex() == 2:
+            self.details.setPlainText(
+                "No matching screenshots or clutter. Prepare previews, then choose Categorize locally."
+            )
 
     def show_selection(self):
         self.matches.clear()
@@ -252,9 +330,11 @@ class ImageBrowser(QDialog):
         if not items:
             return
         row = items[0].data(0, Qt.ItemDataRole.UserRole)
+        suggested = row.get("suggested") if row["image_status"] == "ready" else None
+        suggestion = f"\nSuggested name (select and copy): {suggested}" if suggested else ""
         self.details.setPlainText(
             f"Path: {row['path']}\nRoot: {row['root']}\nSaved size: {row['size']} bytes\n"
-            f"Preview: {row['image_status']}\n{row['error'] or ''}"
+            f"Preview: {row['image_status']}\n{row['error'] or ''}{suggestion}"
         )
         if self.worker is None:
             self.set_busy(False)
@@ -289,9 +369,15 @@ class ImageBrowser(QDialog):
     def on_failed(self, message):
         self.status_label.setText("Image job failed")
         self.details.setPlainText(message)
+        if self._operation == "duplicates":
+            self.duplicate_report.setPlainText(f"Could not load exact duplicates:\n{message}")
 
     def on_cancelled(self):
         self.status_label.setText("Image job cancelled; completed previews are kept")
+        if self._operation == "duplicates":
+            self.duplicate_report.setPlainText(
+                "Duplicate lookup cancelled. Reopen this tab to retry."
+            )
 
     def on_finished(self):
         worker = self.worker
@@ -300,6 +386,11 @@ class ImageBrowser(QDialog):
         self.set_busy(False)
         if self._closing:
             super().reject()
+        elif self._recognition_summary is not None:
+            summary = self._recognition_summary
+            self._recognition_summary = None
+            self.load_first_page()
+            self.on_progress(summary)
 
     def reject(self):
         if self.worker is not None:
