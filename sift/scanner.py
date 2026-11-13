@@ -2,6 +2,9 @@ import os
 import stat
 from collections.abc import Iterator
 from dataclasses import dataclass
+from pathlib import Path
+
+from .local_paths import is_network_path
 
 
 @dataclass
@@ -28,6 +31,12 @@ def _is_link(path: str) -> bool:
 
 
 def scan_folder(root: str) -> Iterator[ScanItem]:
+    if is_network_path(root):
+        yield ScanItem(root, None, None, "skipped", "Network folders are not scanned")
+        return
+    if any(_is_link(str(parent)) for parent in reversed(Path(os.path.abspath(root)).parents)):
+        yield ScanItem(root, None, None, "skipped", "Selected folder has a linked parent")
+        return
     if _is_link(root):
         yield ScanItem(root, None, None, "skipped", "Selected folder is a link; not followed")
         return
@@ -58,7 +67,7 @@ def scan_folder(root: str) -> Iterator[ScanItem]:
                     attrs = getattr(info, "st_file_attributes", 0)
                     is_reparse = bool(attrs & stat.FILE_ATTRIBUTE_REPARSE_POINT)
 
-                    if entry.is_symlink() or (is_dir and is_reparse):
+                    if entry.is_symlink() or is_reparse:
                         yield ScanItem(entry.path, None, None, "skipped", "Link not followed")
                     elif is_dir:
                         stack.append(entry.path)
